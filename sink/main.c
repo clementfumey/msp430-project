@@ -11,6 +11,7 @@
 #endif
 
 #include <stdio.h>
+#include <limits.h>
 
 #include "isr_compat.h"
 #include "leds.h"
@@ -28,30 +29,87 @@
 #include "pt.h"
 
 #define ID 0
-#define COEFF_1_ADDR INFOD_START+1
-#define COEFF_2_ADDR INFOD_START+3
-
 
 #define MSG_BYTE_TYPE 0U //First Byte is type of message
 #define MSG_BYTE_DEST_ROUTE 1U //Second Byte is dest id
 #define MSG_BYTE_SRC_ROUTE 2U // Third is source id
 #define MSG_BYTE_CONTENT 3U // Fourth and fifth is content
 
-#define PKTLEN 5 //Packet lenght
+#define PKTLEN 10 //Packet lenght
 
 // First Byte : Type of message
 
 #define MSG_TYPE_TEMPERATURE 0x02
 
-#define NUM_TIMERS 1
+#define NUM_TIMERS 3
 static uint16_t timer[NUM_TIMERS];
 #define TIMER_SEND_TEMP timer[0]
+#define TIMER_LED_RED_ON timer[1]
+#define TIMER_LED_GREEN_ON timer[2]
+
+void timer_tick_cb() {
+    int i;
+    for(i = 0; i < NUM_TIMERS; i++)
+    {
+        if(timer[i] != UINT_MAX) {
+            timer[i]++;
+        }
+    }
+}
 
 int timer_reached(uint16_t timer, uint16_t count) {
     return (timer >= count);
 }
 
 #define DBG_PRINTF printf
+
+/*
+ * LEDs
+ */
+
+static int led_green_duration;
+static int led_green_flag;
+
+/* asynchronous */
+static void led_green_blink(int duration)
+{
+    led_green_duration = duration;
+    led_green_flag = 1;
+}
+
+static PT_THREAD(thread_led_green(struct pt *pt))
+{
+    PT_BEGIN(pt);
+
+    while(1)
+    {
+        PT_WAIT_UNTIL(pt, led_green_flag);
+        led_green_on();
+        TIMER_LED_GREEN_ON = 0;
+        PT_WAIT_UNTIL(pt, timer_reached(TIMER_LED_GREEN_ON,
+          led_green_duration));
+        led_green_off();
+        led_green_flag = 0;
+    }
+
+    PT_END(pt);
+}
+
+static PT_THREAD(thread_led_red(struct pt *pt))
+{
+    PT_BEGIN(pt);
+
+    while(1)
+    {
+        led_red_switch();
+        TIMER_LED_RED_ON = 0;
+        PT_WAIT_UNTIL(pt, timer_reached(TIMER_LED_RED_ON, 100));
+    }
+
+    PT_END(pt);
+}
+
+
 
 /*
  * Radio
@@ -96,10 +154,12 @@ void radio_cb(uint8_t* buffer, int size, int8_t rssi)
 	    //memcpy(radio_rx_buffer, buffer, PKTLEN);
 	    //FIXME what if radio_rx_flag == 1 already?
 	    radio_rx_flag = 1;
+	    printf("rssi %d\r\n", rssi);
 	}
       else
 	{
 	  /* packet error, drop */
+	  printf("error");
 	  DBG_PRINTF("msg packet error size=%d\n",size);
 	}
       break;
@@ -113,7 +173,7 @@ void radio_cb(uint8_t* buffer, int size, int8_t rssi)
 
 /* Protothread contexts */
 
-#define NUM_PT 1
+#define NUM_PT 3
 static struct pt pt[NUM_PT];
 
 
@@ -179,8 +239,8 @@ int main(void)
 	led_red_on();
 
 	timerA_init();
-	timerA_set_wakeup(1);
-	timerA_start_milliseconds(1000);
+	timerA_register_cb(&timer_tick_cb);
+	timerA_start_milliseconds(10);
 
 	uart_init(UART_9600_SMCLK_8MHZ);
 	printf("Smart GreenHouses: Sink\n\r");
@@ -202,9 +262,11 @@ int main(void)
 	{
 		PT_INIT(&pt[i]);
 	}
-
+	printf("Protothread init\n\r");
 	while(1) {
-		thread_process_msg(&pt[0]);
+	    thread_process_msg(&pt[0]);
+	    thread_led_red(&pt[1]);
+	    thread_led_green(&pt[2]);
 	}
 }
 

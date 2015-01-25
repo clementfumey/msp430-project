@@ -11,6 +11,7 @@
 #endif
 
 #include <stdio.h>
+#include <limits.h>
 
 #include "isr_compat.h"
 #include "leds.h"
@@ -37,7 +38,7 @@
 #define MSG_BYTE_SRC_ROUTE 2U // Third is source id
 #define MSG_BYTE_CONTENT 3U // Fourth is content
 
-#define PKTLEN 5 //Packet lenght
+#define PKTLEN 10 //Packet lenght
 
 // First Byte : Type of message
 
@@ -46,6 +47,16 @@
 #define NUM_TIMERS 1
 static uint16_t timer[NUM_TIMERS];
 #define TIMER_SEND_TEMP timer[0]
+
+void timer_tick_cb() {
+    int i;
+    for(i = 0; i < NUM_TIMERS; i++)
+    {
+        if(timer[i] != UINT_MAX) {
+            timer[i]++;
+        }
+    }
+}
 
 int timer_reached(uint16_t timer, uint16_t count) {
     return (timer >= count);
@@ -61,7 +72,6 @@ static char radio_tx_buffer[PKTLEN];
 static void radio_send_message()
 {
     cc2500_utx(radio_tx_buffer, PKTLEN);
-    cc2500_rx_enter();
 }
 
 /* to be called from within a protothread */
@@ -73,6 +83,10 @@ static void init_message()
         radio_tx_buffer[i] = 0x00;
     }
     radio_tx_buffer[MSG_BYTE_SRC_ROUTE] = ID;
+    radio_tx_buffer[6] = 0x04;
+    radio_tx_buffer[7] = 0x03;
+    radio_tx_buffer[8] = 0x02;
+    radio_tx_buffer[9] = 0x01;
 }
 
 /* to be called from within a protothread */
@@ -81,11 +95,14 @@ static void send_temperature()
     init_message();
     radio_tx_buffer[MSG_BYTE_TYPE] = MSG_TYPE_TEMPERATURE;
     int temperature = adc10_sample_temp();
+    printf("temp: %d,%d°C\n\r",temperature/10,temperature%10);
     /* msp430 is little endian, convert temperature to network order */
     char *pt = (char *) &temperature;
     radio_tx_buffer[MSG_BYTE_CONTENT] = pt[1];
     radio_tx_buffer[MSG_BYTE_CONTENT + 1] = pt[0];
+    led_green_switch();
     radio_send_message();
+    led_red_switch();
 }
 
 /* Protothread contexts */
@@ -106,6 +123,7 @@ static PT_THREAD(thread_send_temp(struct pt *pt))
         TIMER_SEND_TEMP = 0;
         PT_WAIT_UNTIL(pt, timer_reached( TIMER_SEND_TEMP, 1000));
         send_temperature();
+        
     }
 
     PT_END(pt);
@@ -117,8 +135,6 @@ static PT_THREAD(thread_send_temp(struct pt *pt))
 
 int main(void)
 {
-	int temp;
-
 	volatile int adc_coeff_1, adc_coeff_2 = 0;
 	watchdog_stop();
 
@@ -127,14 +143,17 @@ int main(void)
 	led_red_on();
 
 	timerA_init();
-	timerA_set_wakeup(1);
-	timerA_start_milliseconds(1000);
+    timerA_register_cb(&timer_tick_cb);
+    timerA_start_milliseconds(10);
 
 	uart_init(UART_9600_SMCLK_8MHZ);
 	printf("Smart GreenHouses: temperature sensor\n\r");
 
 	adc10_start();
-
+	
+	spi_init();
+	cc2500_init();
+  
 	/* We search for calibration data in flash */
 	if (*((char *)COEFF_1_ADDR) !=0xFFFF){
 		/* Get calibration data from flash */
