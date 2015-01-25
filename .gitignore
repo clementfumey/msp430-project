@@ -1,0 +1,16 @@
+# Compiled source #
+###################
+*.o
+*.so
+
+#   Directory     #
+###################
+capteur/.deps/
+capteur/.obj/
+capteur/bin/
+externals_libraries/ez430-drivers/.deps/
+externals_libraries/ez430-drivers/.obj/
+externals_libraries/ez430-drivers/lib/
+sink/.deps/
+sink/.obj/
+sink/bin/
