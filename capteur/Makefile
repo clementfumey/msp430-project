@@ -35,7 +35,7 @@ ${OUT_DIR}/${NAME}.lst: ${OUT_DIR}/${NAME}.elf
 ${OBJ_DIR}/%.o: %.c
 	@mkdir -p ${OBJ_DIR} ${DEP_DIR}
 	${MAKEDEPEND} $<
-	${CC} ${CFLAGS} -c $< -o $@
+	${CC} ${CFLAGS} -DIDDEF=${ID} -c $< -o $@
 
 -include ${DEPS}
 

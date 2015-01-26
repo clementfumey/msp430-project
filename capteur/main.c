@@ -28,7 +28,12 @@
 
 #include "pt.h"
 
-#define ID 1
+#if defined IDDEF && IDDEF > 1
+#define ID IDDEF
+#else
+#define ID 255
+#endif
+
 #define COEFF_1_ADDR INFOD_START+1
 #define COEFF_2_ADDR INFOD_START+3
 
@@ -41,8 +46,11 @@
 #define PKTLEN 10 //Packet lenght
 
 // First Byte : Type of message
+#define MSG_TYPE_RTS 0x01
+#define MSG_TYPE_CTS 0x02
+#define MSG_TYPE_TEMPERATURE 0x03
 
-#define MSG_TYPE_TEMPERATURE 0x02
+#define DBG_PRINTF printf
 
 /* ************ */
 /*     Leds     */
@@ -71,12 +79,15 @@ static void led_red_blink(int duration)
 /* ************ */
 /*    Timers    */
 /* ************ */
-#define NUM_TIMERS 4
+#define NUM_TIMERS 5
 static uint16_t timer[NUM_TIMERS];
 #define TIMER_SEND_TEMP timer[0]
 #define TIMER_ANTIBOUNCING timer[1]
 #define TIMER_LED_RED_ON timer[2]
 #define TIMER_LED_GREEN_ON timer[3]
+#define TIMER_RTS_CTS timer[4]
+
+#define RTS_TIMEOUT 500
 
 void timer_tick_cb() {
     int i;
@@ -124,23 +135,84 @@ void button_pressed_cb()
 /* ************ */
 /*    Radio     */
 /* ************ */
-
+static int clear_to_send_flag;
+static int rts_retry;
 static char radio_tx_buffer[PKTLEN];
+static uint8_t radio_rx_buffer[PKTLEN];
+static int radio_rx_flag;
+static void printhex(char *buffer, unsigned int len)
+{
+    unsigned int i;
+    for(i = 0; i < len; i++)
+    {
+        printf("%02X ", buffer[i]);
+    }
+}
 
 static void radio_send_message()
 {
+	
     cc2500_utx(radio_tx_buffer, PKTLEN);
+    printhex(radio_tx_buffer, PKTLEN);
+	printf("\r\n");
+	//cc2500_idle();
+    cc2500_rx_enter(); //If we put this one just after cc2500_utx it fail and we receveid BAD_CRC
+}
+
+void radio_cb(uint8_t* buffer, int size, int8_t rssi)
+{
+  led_green_switch();
+  switch (size)
+    {
+    case 0:
+      DBG_PRINTF("msg size 0\n");
+      break;
+    case -EEMPTY:
+      DBG_PRINTF("msg empty\n");
+      break;
+    case -ERXFLOW:
+      DBG_PRINTF("msg rx overflow\n");
+      break;
+    case -ERXBADCRC:
+      DBG_PRINTF("msg rx bad CRC\n");
+      break;
+    case -ETXFLOW:
+      DBG_PRINTF("msg tx overflow\n");
+      break;
+    default:
+      if (size > 0)
+	{
+	  // memcpy(buffer_rx_msg, buffer, MSG_SIZE);
+	  DBG_PRINTF("rssi %d\r\n", rssi);
+	  
+	    //memcpy(radio_rx_buffer, buffer, PKTLEN);
+	    //FIXME what if radio_rx_flag == 1 already?
+	    radio_rx_flag = 1;
+	    printf("rssi %d\r\n", rssi);
+	}
+      else
+	{
+	  /* packet error, drop */
+	  printf("error");
+	  DBG_PRINTF("msg packet error size=%d\n",size);
+	}
+      break;
+    }
+  cc2500_idle();
+  cc2500_rx_enter();
+  led_green_switch();
 }
 
 /* to be called from within a protothread */
 static void init_message()
 {
     unsigned int i;
-    for(i = 0; i < PKTLEN; i++)
+    for(i=0; i<PKTLEN; i++)
     {
-        radio_tx_buffer[i] = 0x00;
+      radio_tx_buffer[i] = 0x00;
     }
     radio_tx_buffer[MSG_BYTE_SRC_ROUTE] = ID;
+    /* useless bytes because cc2500 driver don't like small packets*/
     radio_tx_buffer[6] = 0x04;
     radio_tx_buffer[7] = 0x03;
     radio_tx_buffer[8] = 0x02;
@@ -162,9 +234,24 @@ static void send_temperature()
     radio_send_message();
 }
 
+/* to be called from within a protothread */
+static void send_rts()
+{
+	led_green_blink(10);
+    init_message();
+    radio_tx_buffer[MSG_BYTE_TYPE] = MSG_TYPE_RTS;
+    radio_tx_buffer[MSG_BYTE_DEST_ROUTE] = 1;
+    radio_tx_buffer[MSG_BYTE_CONTENT] = 0x05;
+    radio_tx_buffer[MSG_BYTE_CONTENT + 1] = 0x06;
+	radio_send_message();
+}
+
+
+
+
 /* Protothread contexts */
 
-#define NUM_PT 5
+#define NUM_PT 6
 static struct pt pt[NUM_PT];
 
 /* ************************************************** */
@@ -241,14 +328,48 @@ static PT_THREAD(thread_send_temp(struct pt *pt))
     while(1)
     {
         TIMER_SEND_TEMP = 0;
+        rts_retry = 0;
         PT_WAIT_UNTIL(pt, send_mode_flag && timer_reached( TIMER_SEND_TEMP, 1000));
-        send_temperature();
+        while(rts_retry < 5 && clear_to_send_flag != 1) {
+			TIMER_RTS_CTS = 0;
+			printf("Try number: %d\n CTS-flag: %d\n", rts_retry, clear_to_send_flag);
+			send_rts(); //TODO add randomness sleep before every retry;
+			/* Wait until a cts has been received, or until the
+			   timer expires or until rts_retry reach 5. If the timer expires, we should send the packet
+			   again. */
+			PT_WAIT_UNTIL(pt,  clear_to_send_flag || timer_reached(TIMER_RTS_CTS, RTS_TIMEOUT));
+			rts_retry++;
+		}
+        if (clear_to_send_flag){
+			send_temperature();
+			clear_to_send_flag = 0;
+		}else{
+			printf("Too many retries");
+		}
         
     }
 
     PT_END(pt);
 }
 
+static PT_THREAD(thread_process_msg(struct pt *pt))
+{
+    PT_BEGIN(pt);
+
+    while(1)
+    {
+        PT_WAIT_UNTIL(pt, radio_rx_flag == 1);
+	
+        if(radio_rx_buffer[MSG_BYTE_TYPE] == MSG_TYPE_CTS && radio_rx_buffer[MSG_BYTE_DEST_ROUTE] == ID){
+			clear_to_send_flag = 1;
+        }else{
+			
+		}
+        radio_rx_flag = 0;
+    }
+
+    PT_END(pt);
+}
 /* ************************************************** */
 /* ************************************************** */
 /* ************************************************** */
@@ -275,9 +396,14 @@ int main(void)
 	/* temp init */
 	adc10_start();
 	
-	/* radio init */ //rx init missing
+	/* radio init */
 	spi_init();
 	cc2500_init();
+	cc2500_rx_register_buffer(radio_rx_buffer, PKTLEN);
+	cc2500_rx_register_cb(radio_cb);
+	cc2500_rx_enter();
+	radio_rx_flag = 0;
+	clear_to_send_flag = 0;
 	
 	/* button init */
     button_init();
@@ -321,6 +447,8 @@ int main(void)
 		thread_antibouncing(&pt[2]);
 		thread_led_red(&pt[3]);
 		thread_led_green(&pt[4]);
+		thread_process_msg(&pt[5]);
+		
 	}
 }
 

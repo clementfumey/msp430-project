@@ -28,7 +28,7 @@
 
 #include "pt.h"
 
-#define ID 0
+#define ID 1
 
 #define MSG_BYTE_TYPE 0U //First Byte is type of message
 #define MSG_BYTE_DEST_ROUTE 1U //Second Byte is dest id
@@ -38,8 +38,9 @@
 #define PKTLEN 10 //Packet lenght
 
 // First Byte : Type of message
-
-#define MSG_TYPE_TEMPERATURE 0x02
+#define MSG_TYPE_RTS 0x01
+#define MSG_TYPE_CTS 0x02
+#define MSG_TYPE_TEMPERATURE 0x03
 
 #define NUM_TIMERS 3
 static uint16_t timer[NUM_TIMERS];
@@ -77,52 +78,39 @@ static void led_green_blink(int duration)
     led_green_flag = 1;
 }
 
-static PT_THREAD(thread_led_green(struct pt *pt))
+static int led_red_duration;
+static int led_red_flag;
+
+/* asynchronous */
+static void led_red_blink(int duration)
 {
-    PT_BEGIN(pt);
-
-    while(1)
-    {
-        PT_WAIT_UNTIL(pt, led_green_flag);
-        led_green_on();
-        TIMER_LED_GREEN_ON = 0;
-        PT_WAIT_UNTIL(pt, timer_reached(TIMER_LED_GREEN_ON,
-          led_green_duration));
-        led_green_off();
-        led_green_flag = 0;
-    }
-
-    PT_END(pt);
+    led_red_duration = duration;
+    led_red_flag = 1;
 }
-
-static PT_THREAD(thread_led_red(struct pt *pt))
-{
-    PT_BEGIN(pt);
-
-    while(1)
-    {
-        led_red_switch();
-        TIMER_LED_RED_ON = 0;
-        PT_WAIT_UNTIL(pt, timer_reached(TIMER_LED_RED_ON, 100));
-    }
-
-    PT_END(pt);
-}
-
 
 
 /*
  * Radio
  */
-
+static int clear_to_send_flag;
 static char radio_tx_buffer[PKTLEN];
 static uint8_t radio_rx_buffer[PKTLEN];
 static int radio_rx_flag;
+static void printhex(char *buffer, unsigned int len)
+{
+    unsigned int i;
+    for(i = 0; i < len; i++)
+    {
+        printf("%02X ", buffer[i]);
+    }
+}
 
 static void radio_send_message()
 {
     cc2500_utx(radio_tx_buffer, PKTLEN);
-    cc2500_rx_enter();
+    printhex(radio_tx_buffer, PKTLEN);
+    printf("\r\n");
+    cc2500_rx_enter(); //If we put this one just after cc2500_utx it fail and we receveid BAD_CRC
 }
 
 void radio_cb(uint8_t* buffer, int size, int8_t rssi)
@@ -169,13 +157,22 @@ void radio_cb(uint8_t* buffer, int size, int8_t rssi)
   led_green_switch();
 }
 
-
-
-/* Protothread contexts */
-
-#define NUM_PT 3
-static struct pt pt[NUM_PT];
-
+/* to be called from within a protothread */
+static void init_message()
+{
+    unsigned int i;
+    for(i = 0; i < PKTLEN; i++)
+    {
+      /* msg[0] == id */
+      radio_tx_buffer[i] = ID + i;
+    }
+    radio_tx_buffer[MSG_BYTE_SRC_ROUTE] = ID;
+    /* useless bytes becaus cc2500 driver don't like small packets*/
+    radio_tx_buffer[6] = 0x04;
+    radio_tx_buffer[7] = 0x03;
+    radio_tx_buffer[8] = 0x02;
+    radio_tx_buffer[9] = 0x01;
+}
 
 static void dump_message(uint8_t *buffer)
 {
@@ -201,9 +198,60 @@ static void dump_message(uint8_t *buffer)
     }
 
 }
+
+/* to be called from within a protothread */
+static void send_cts(uint8_t dest)
+{
+    led_green_blink(10);
+    init_message();
+    radio_tx_buffer[MSG_BYTE_TYPE] = MSG_TYPE_CTS;
+    radio_tx_buffer[MSG_BYTE_DEST_ROUTE] = dest;
+    radio_send_message();
+}
+
+/* Protothread contexts */
+
+#define NUM_PT 3
+static struct pt pt[NUM_PT];
+
 /* ************************************************** */
 /* ************************************************** */
 /* ************************************************** */
+static PT_THREAD(thread_led_green(struct pt *pt))
+{
+    PT_BEGIN(pt);
+
+    while(1)
+    {
+        PT_WAIT_UNTIL(pt, led_green_flag);
+        led_green_on();
+        TIMER_LED_GREEN_ON = 0;
+        PT_WAIT_UNTIL(pt, timer_reached(TIMER_LED_GREEN_ON,
+          led_green_duration));
+        led_green_off();
+        led_green_flag = 0;
+    }
+
+    PT_END(pt);
+}
+
+static PT_THREAD(thread_led_red(struct pt *pt))
+{
+    PT_BEGIN(pt);
+
+    while(1)
+    {
+        PT_WAIT_UNTIL(pt, led_red_flag);
+        led_red_on();
+        TIMER_LED_RED_ON = 0;
+        PT_WAIT_UNTIL(pt, timer_reached(TIMER_LED_RED_ON,
+          led_red_duration));
+        led_red_off();
+        led_red_flag = 0;
+    }
+
+    PT_END(pt);
+}
 
 static PT_THREAD(thread_process_msg(struct pt *pt))
 {
@@ -212,13 +260,20 @@ static PT_THREAD(thread_process_msg(struct pt *pt))
     while(1)
     {
         PT_WAIT_UNTIL(pt, radio_rx_flag == 1);
-
-        dump_message(radio_rx_buffer);
 	
         if(radio_rx_buffer[MSG_BYTE_TYPE] == MSG_TYPE_TEMPERATURE ){
             //&& radio_rx_buffer[MSG_BYTE_DEST_ROUTE] == ID
-        }else{
-	
+	    dump_message(radio_rx_buffer);
+	    clear_to_send_flag = 1;
+        }else if(radio_rx_buffer[MSG_BYTE_TYPE] == MSG_TYPE_RTS){
+	    if (clear_to_send_flag = 1){
+		printf("RTS message received from %D\n",radio_rx_buffer[MSG_BYTE_SRC_ROUTE]);
+		send_cts(radio_rx_buffer[MSG_BYTE_SRC_ROUTE]);
+		clear_to_send_flag = 0;
+		//timer cts = 0;
+	    }
+	}else{
+	    clear_to_send_flag = 1;
 	}
         radio_rx_flag = 0;
     }
@@ -252,6 +307,7 @@ int main(void)
 	cc2500_rx_register_cb(radio_cb);
 	cc2500_rx_enter();
 	radio_rx_flag = 0;
+	clear_to_send_flag = 1;
 
   __enable_interrupt();
 
